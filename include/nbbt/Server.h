@@ -27,7 +27,8 @@
 
 //------------------------------------------------------------------------------
 
-#include "nbbt/Buffer.h"
+#include <cstddef> /* size_t */
+#include <string>
 
 //------------------------------------------------------------------------------
 
@@ -35,29 +36,67 @@ namespace nbbt {
 
 //------------------------------------------------------------------------------
 
-class Server
+typedef int client_t;
+
+//------------------------------------------------------------------------------
+
+class IServer
 {
 public:
-    struct Client {
-        Buffer rbuffer;
-        Buffer wbuffer;
-    };
+    virtual bool send(client_t client, unsigned char const* src, size_t bytes) = 0;
+    virtual bool memcpy(client_t client, unsigned char* dest, size_t bytes) const = 0;
+    virtual void remove(client_t client, size_t bytes) = 0;
+    virtual size_t available(client_t client) const = 0;
+    virtual bool get_string(client_t client, std::string& string, bool take = false) = 0;
 
+    virtual void onConnected(client_t client) = 0;
+    virtual void onDisconnected(client_t client) = 0;
+    virtual void onReadyRead(client_t client) = 0;
+};
+
+//------------------------------------------------------------------------------
+
+class Server : public IServer
+{
 public:
     Server();
     virtual ~Server();
 
-    bool init(int port, int domain = AF_INET, size_t epoll_queue_len = 1024);
+    bool init(int port, int domain = AF_INET);
     bool run(int timeout = -1);
 
-    virtual void onConnected(Client* client) = 0;
-    virtual void onDisconnected(Client* client) = 0;
-    virtual void onReadyRead(Client* client) = 0;
+    bool send(client_t client, unsigned char const* src, size_t bytes) override;
+    bool memcpy(client_t client, unsigned char* dest, size_t bytes) const override;
+    void remove(client_t client, size_t bytes) override;
+    size_t available(client_t client) const override;
+    bool get_string(client_t client, std::string& string, bool take = false) override;
 
 private:
     struct ServerImpl;
     ServerImpl* p;
 }; // class Server
+
+//------------------------------------------------------------------------------
+
+class ThreadedServer: public IServer
+{
+public:
+    ThreadedServer();
+    virtual ~ThreadedServer();
+
+    bool init(int port, int domain = AF_INET);
+    void start();
+
+    bool send(client_t client, unsigned char const* src, size_t bytes) override;
+    bool memcpy(client_t client, unsigned char* dest, size_t bytes) const override;
+    void remove(client_t client, size_t bytes) override;
+    size_t available(client_t client) const override;
+    bool get_string(client_t client, std::string& string, bool take = false) override;
+
+private:
+    struct ThreadedServerImpl;
+    ThreadedServerImpl* p;
+}; // class ThreadedServer
 
 //------------------------------------------------------------------------------
 

@@ -23,8 +23,9 @@
  */
 
 #include "nbbt/Server.h"
-#include "nbbt/log.h"
-#include "nbbt/socket.h"
+#include "Buffer.h"
+#include "log.h"
+#include "socket.h"
 
 #include <map>
 #include <sys/epoll.h>
@@ -35,26 +36,32 @@ namespace nbbt {
 
 //------------------------------------------------------------------------------
 
-struct ClientData
+static size_t const c_epoll_queue_len = 1024;
+
+//------------------------------------------------------------------------------
+
+struct Client
 {
-    Server::Client client;
     socket_t socket;
+    client_t id;
     struct epoll_event event;
+    Buffer rbuffer;
+    Buffer wbuffer;
 };
 
 //------------------------------------------------------------------------------
 
 struct Server::ServerImpl
 {
-    ClientData* accept();
-    void disconnected(ClientData* client);
+    Client* accept();
+    void disconnected(Client* client);
 
     int epoll_ = -1;
     struct epoll_event* events_ = nullptr;
-    size_t epoll_events_size = 0;
 
     socket_t listener_ = INVALID_SOCKET;
-    std::map<socket_t, ClientData*> clients_;
+    std::map<socket_t, Client*> clients_;
+    std::map<client_t, Client*> idMapping_;
 };
 
 //------------------------------------------------------------------------------
@@ -93,20 +100,23 @@ Server::~Server()
 
 //------------------------------------------------------------------------------
 
-bool Server::init(int port, int domain, size_t epoll_queue_len)
+bool Server::init(int port, int domain)
 {
-    p->listener_ = INVALID_SOCKET;
-    struct sockaddr_in address;
-    int one = 1;
+    // dDon't call again, when already listening.
+    if (p->listener_ != INVALID_SOCKET) {
+        return false;
+    }
 
     if ((p->listener_ = ::socket(domain, SOCK_STREAM | SOCK_NONBLOCK, 0)) == INVALID_SOCKET) {
         goto init_socket_failed;
     }
 
+    int one = 1;
     if (::setsockopt(p->listener_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == -1) {
         goto init_socket_failed;
     }
 
+    struct sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
@@ -131,8 +141,7 @@ bool Server::init(int port, int domain, size_t epoll_queue_len)
         goto init_socket_failed;
     }
 
-    p->epoll_events_size = epoll_queue_len;
-    p->events_ = new struct epoll_event[epoll_queue_len];
+    p->events_ = new struct epoll_event[c_epoll_queue_len];
 
     return true;
 
@@ -152,14 +161,14 @@ bool Server::run(int timeout)
         return false;
     }
 
-    int nfds = ::epoll_wait(p->epoll_, p->events_, p->epoll_events_size, timeout);
+    int nfds = ::epoll_wait(p->epoll_, p->events_, c_epoll_queue_len, timeout);
     if (-1 == nfds) {
         log_last_socket_error();
         return false;
     }
 
-    for (int n = 0; n < nfds; ++n) {
-        struct epoll_event const& event = p->events_[n];
+    for (int i = 0; i < nfds; ++i) {
+        struct epoll_event const& event = p->events_[i];
 
         if (event.data.fd == p->listener_) {
             // new client connects
@@ -168,72 +177,78 @@ bool Server::run(int timeout)
                 onConnected(&(client->client));
             }
             continue;
-        } else { // client socket
-            auto it = p->clients_.find(event.data.fd);
-            if (it == p->clients_.end()) {
-                LOG_ERR(u8"unknown socket");
-                break;
-            }
-            ClientData* client = (*it).second;
+        }
 
-            // socket has disconnected
-            if (event.events & (EPOLLERR | EPOLLHUP)) {
-                LOG_WARN_F(u8"Socket error (events:%u)", event.events);
+        // client socket
+        auto it = p->clients_.find(event.data.fd);
+        if (it == p->clients_.end()) {
+            LOG_ERR(u8"unknown socket");
+            break;
+        }
+        ClientData* client = (*it).second;
+
+        // socket has disconnected
+        if (event.events & (EPOLLERR | EPOLLHUP)) {
+            LOG_WARN_F(u8"Socket error (events:%u)", event.events);
+            p->disconnected(client);
+            onDisconnected(&(client->client));
+            continue;
+        }
+
+        if (event.events & EPOLLRDHUP) {
+            // client closed the connection
+            p->disconnected(client);
+            onDisconnected(&(client->client));
+            continue;
+        }
+
+        // data available to read from client/slave
+        if (event.events & EPOLLIN) {
+            size_t read;
+            if (client->client.rbuffer.read(read) < 1) {
+                log_last_socket_error();
+                continue;
+            }
+
+            onReadyRead(&(client->client));
+        }
+
+        // write buffer has more space
+        if (event.events & EPOLLOUT) {
+            // write more data
+            switch (client->client.wbuffer.flush()) {
+            case 0: // socket disconnected
+            {
                 p->disconnected(client);
                 onDisconnected(&(client->client));
                 continue;
             }
-
-            if (event.events & EPOLLRDHUP) {
-                // client closed the connection
-                p->disconnected(client);
-                onDisconnected(&(client->client));
-                continue;
+            case -1:
+            {
+                log_last_socket_error();
+            } break;
+            default:
+            {
+                // noop
             }
+            } // switch
 
-            // data available to read from client/slave
-            if (event.events & EPOLLIN) {
-                size_t read;
-                if (client->client.rbuffer.read(read) < 1) {
+            // if no more data needs to be written, we can remove the EPOLLOUT flag
+            if (client->client.wbuffer.available() == 0) {
+                client->event.events &= ~EPOLLOUT;
+                if (-1 == ::epoll_ctl(p->epoll_, EPOLL_CTL_MOD, client->socket, &client->event)) {
                     log_last_socket_error();
-                    continue;
-                }
-
-                onReadyRead(&(client->client));
-            }
-
-            // write buffer has more space
-            if (event.events & EPOLLOUT) {
-                // write more data
-                switch (client->client.wbuffer.flush()) {
-                case 0: // socket disconnected
-                {
-                    p->disconnected(client);
-                    onDisconnected(&(client->client));
-                    continue;
-                }
-                case -1:
-                {
-                    log_last_socket_error();
-                } break;
-                default:
-                {
-                    // noop
-                }
-                } // switch
-
-                // if no more data needs to be written, we can remove the EPOLLOUT flag
-                if (client->client.wbuffer.available() == 0) {
-                    client->event.events &= ~EPOLLOUT;
-                    if (-1 == ::epoll_ctl(p->epoll_, EPOLL_CTL_MOD, client->socket, &client->event)) {
-                        log_last_socket_error();
-                    }
                 }
             }
         }
     }
 
     return true;
+}
+
+bool Server::send(client_t client, const unsigned char* src, size_t bytes)
+{
+
 }
 
 //------------------------------------------------------------------------------
@@ -274,7 +289,7 @@ ClientData* Server::ServerImpl::accept()
             return nullptr;
         }
 
-        if (-1 == ::epoll_ctl(epoll_, EPOLL_CTL_ADD, socket, &client->event)) { // @unlikely
+        if (-1 == ::epoll_ctl(epoll_, EPOLL_CTL_ADD, socket, &client->event)) {
             log_last_socket_error();
             socket_close(socket);
             delete client;

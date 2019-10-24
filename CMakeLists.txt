@@ -9,7 +9,7 @@ project(nbbt)
 
 include_directories(include)
 
-file(GLOB lib_src "src/*.cpp")
+file(GLOB lib_src "src/*.*")
 file(GLOB lib_h "include/nbbt/*.h")
 add_library(${PROJECT_NAME} STATIC ${lib_src} ${lib_h})
 
